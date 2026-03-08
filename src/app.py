@@ -1,6 +1,5 @@
 """
 AI Agent Server - Flask HTTP API for task execution with Claude (Anthropic).
-Provides endpoints for task submission, status checking, and cancellation.
 """
 
 import os
@@ -29,18 +28,10 @@ from utils.file_manager import (
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------------------------
-# Startup initialisation
-# ---------------------------------------------------------------------------
-
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 cleanup_old_workspaces(is_task_active_fn=is_task_active)
 start_cleanup_scheduler(is_task_active_fn=is_task_active)
 
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -98,6 +89,7 @@ def get_task_status(task_id: str):
         "Status": task.status.value,
         "Message": task.message,
         "OutputFiles": task.output_files,
+        "DirectResponse": task.direct_response,   
         "Error": task.error,
     })
 

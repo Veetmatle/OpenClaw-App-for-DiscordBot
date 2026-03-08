@@ -20,10 +20,14 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 def call_claude_with_retry(
     system_prompt: str,
-    user_prompt: str,
+    messages: list[dict],
     model: str,
     task: AgentTask,
 ) -> str:
+    """
+    Call Claude with a proper multi-turn message list.
+    `messages` should be a list of {"role": "user"|"assistant", "content": str} dicts.
+    """
     from datetime import datetime
 
     attempt = 0
@@ -42,7 +46,7 @@ def call_claude_with_retry(
                 model=model,
                 max_tokens=8192,
                 system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
+                messages=messages,
             )
             return response.content[0].text
         except anthropic.RateLimitError as e:

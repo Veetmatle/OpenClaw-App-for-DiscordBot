@@ -20,6 +20,10 @@ _SESSION_TIMEOUT_MINUTES = int(os.environ.get("AGENT_SESSION_TIMEOUT_MINUTES", "
 TIMEOUT_SECONDS = _SESSION_TIMEOUT_MINUTES * 60
 MAX_CONCURRENT_TASKS = int(os.environ.get("MAX_CONCURRENT_TASKS", "2"))
 
+# Responses under this character count are treated as "direct answers" even if
+# the agent doesn't explicitly signal DIRECT_ANSWER (safety fallback).
+SHORT_RESPONSE_THRESHOLD = int(os.environ.get("SHORT_RESPONSE_THRESHOLD", "1500"))
+
 
 class TaskStatus(str, Enum):
     QUEUED = "queued"
@@ -41,6 +45,7 @@ class AgentTask:
     message: Optional[str] = None
     error: Optional[str] = None
     output_files: list = field(default_factory=list)
+    direct_response: Optional[str] = None   # <-- NEW: text answer without files
     created_at: datetime = field(default_factory=datetime.utcnow)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -67,9 +72,37 @@ def update_task(task: AgentTask) -> None:
 
 
 def is_task_active(task_id: str) -> bool:
-    """Return True when the task is still running or queued (used by cleanup)."""
     task = get_task(task_id)
     return task is not None and task.status in (TaskStatus.RUNNING, TaskStatus.QUEUED)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _build_initial_user_message(task: AgentTask) -> str:
+    """Combine prompt + optional document into the first user turn."""
+    msg = task.prompt
+    if task.document_content:
+        msg += f"\n\nAttached document:\n---\n{task.document_content}\n---"
+    return msg
+
+
+def _is_direct_answer(assistant_message: str) -> bool:
+    """Return True when the agent signals a plain-text answer (no file needed)."""
+    upper = assistant_message.upper()
+    if "DIRECT_ANSWER" in upper:
+        return True
+    # Heuristic: no code blocks AND short response → treat as direct answer
+    has_code = "```" in assistant_message
+    if not has_code and len(assistant_message.strip()) <= SHORT_RESPONSE_THRESHOLD:
+        return True
+    return False
+
+
+def _strip_signal(text: str, signal: str) -> str:
+    """Remove the terminal signal word from the response text."""
+    return text.replace(signal, "").replace(signal.lower(), "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -92,17 +125,18 @@ def execute_agent_task(task: AgentTask) -> None:
 
         workspace = create_workspace(task.task_id)
 
-        user_prompt = task.prompt
-        if task.document_content:
-            user_prompt += f"\n\nAttached document:\n---\n{task.document_content}\n---"
+        # --- Multi-turn message history (proper Anthropic format) ---
+        # Always starts with a user turn; assistant turns are appended after each response.
+        messages: list[dict] = [
+            {"role": "user", "content": _build_initial_user_message(task)}
+        ]
 
-        conversation_history = user_prompt
         iteration = 0
         consecutive_empty_iterations = 0
 
         while iteration < task.max_iterations and not task.cancelled:
             iteration += 1
-            print(f"[ReAct] Task {task.task_id}: Starting iteration {iteration}/{task.max_iterations}", flush=True)
+            print(f"[ReAct] Task {task.task_id}: iteration {iteration}/{task.max_iterations}", flush=True)
 
             elapsed = (datetime.utcnow() - task.started_at).total_seconds()
             if elapsed > task.timeout_seconds:
@@ -110,10 +144,28 @@ def execute_agent_task(task: AgentTask) -> None:
                 task.error = f"Task timed out after {task.timeout_seconds}s"
                 break
 
+            # --- Call Claude ---
             assistant_message = call_claude_with_retry(
-                SYSTEM_PROMPT, conversation_history, task.model, task
+                SYSTEM_PROMPT, messages, task.model, task
             )
 
+            # Append assistant turn to history immediately
+            messages.append({"role": "assistant", "content": assistant_message})
+
+            # ---------------------------------------------------------------
+            # Check: is this a direct text answer?
+            # ---------------------------------------------------------------
+            if _is_direct_answer(assistant_message):
+                clean = _strip_signal(assistant_message, "DIRECT_ANSWER")
+                task.direct_response = clean
+                task.status = TaskStatus.COMPLETED
+                task.message = f"Direct answer returned after {iteration} iteration(s)."
+                print(f"[ReAct] Task {task.task_id}: DIRECT_ANSWER", flush=True)
+                break
+
+            # ---------------------------------------------------------------
+            # Execute code blocks
+            # ---------------------------------------------------------------
             execution_results = []
             command_errors = []
             curl_commands_run = []
@@ -123,6 +175,8 @@ def execute_agent_task(task: AgentTask) -> None:
 
             while i < len(lines):
                 line = lines[i]
+
+                # File creation block: ```filename.ext
                 if line.startswith('```') and not line.startswith('```bash'):
                     filename = line[3:].strip()
                     if filename and '.' in filename:
@@ -131,15 +185,15 @@ def execute_agent_task(task: AgentTask) -> None:
                         while i < len(lines) and not lines[i].startswith('```'):
                             content_lines.append(lines[i])
                             i += 1
-
+                        # Strip accidental filename echo on first line
                         if content_lines and content_lines[0].strip() == filename:
                             content_lines.pop(0)
-
                         file_path = workspace / filename
                         file_path.parent.mkdir(parents=True, exist_ok=True)
                         file_path.write_text('\n'.join(content_lines))
                         execution_results.append(f"[FILE CREATED] {filename} ({len(content_lines)} lines)")
 
+                # Bash execution block
                 elif line.startswith('```bash'):
                     cmd_lines = []
                     i += 1
@@ -154,10 +208,10 @@ def execute_agent_task(task: AgentTask) -> None:
 
                     if python_lines_detected >= 3:
                         execution_results.append(
-                            "[CRITICAL ERROR] You put Python code inside a ```bash block!\n"
+                            "[ERROR] Python code inside ```bash block. "
                             "Create a .py file first, then run it with: python3 script.py"
                         )
-                        command_errors.append("Python code detected in bash block")
+                        command_errors.append("Python code in bash block")
                     else:
                         for cmd in cmd_lines:
                             cmd = cmd.strip()
@@ -170,87 +224,74 @@ def execute_agent_task(task: AgentTask) -> None:
                                 returncode, stdout, stderr = run_command(
                                     ["bash", "-c", cmd], cwd=workspace, timeout=120
                                 )
-                                result = f"[COMMAND] $ {cmd}\n[EXIT CODE] {returncode}"
+                                result = f"$ {cmd}\n[exit {returncode}]"
                                 if stdout:
-                                    result += f"\n[STDOUT]\n{stdout[:3000]}"
+                                    result += f"\n{stdout[:3000]}"
                                 if stderr:
-                                    result += f"\n[STDERR]\n{stderr[:2000]}"
+                                    result += f"\n[stderr] {stderr[:1000]}"
                                 execution_results.append(result)
 
                                 if returncode != 0:
-                                    command_errors.append(
-                                        f"Command '{cmd[:50]}...' failed with exit code {returncode}"
-                                    )
-                                    if ('python' in cmd and '.py' in cmd) and not curl_commands_run:
-                                        execution_results.append(
-                                            "\n[STRATEGY ERROR] Python failed without prior curl exploration!\n"
-                                            "Use curl to find working endpoints FIRST."
-                                        )
+                                    command_errors.append(f"'{cmd[:60]}' failed (exit {returncode})")
                 i += 1
 
+            # ---------------------------------------------------------------
+            # Check: wants to complete via TASK COMPLETE
+            # ---------------------------------------------------------------
             wants_to_complete = "TASK COMPLETE" in assistant_message.upper()
 
             if wants_to_complete:
                 is_valid, validation_msg, _ = validate_output_files(workspace)
-                print(
-                    f"[ReAct] Task {task.task_id}: Completion requested. "
-                    f"Validation: {is_valid} - {validation_msg}",
-                    flush=True,
-                )
-
                 if is_valid:
                     task.output_files = select_output_files(workspace)
                     task.status = TaskStatus.COMPLETED
                     task.message = f"Task completed after {iteration} iteration(s). {validation_msg}"
-                    print(
-                        f"[ReAct] Task {task.task_id}: COMPLETED with {len(task.output_files)} file(s)",
-                        flush=True,
-                    )
+                    print(f"[ReAct] Task {task.task_id}: COMPLETED ({len(task.output_files)} files)", flush=True)
                     break
                 else:
+                    # Validation failed — feed back as next user turn
                     feedback = (
-                        f"[VALIDATION FAILED] Output not valid: {validation_msg}\n"
-                        "You MUST try a different approach. Do not give up."
+                        f"Output validation failed: {validation_msg}\n"
+                        "Verify the file exists and contains real data. Try again."
                     )
-                    conversation_history += (
-                        f"\n\n[Assistant]:\n{assistant_message}\n\n[System Feedback]:\n{feedback}"
-                    )
+                    messages.append({"role": "user", "content": feedback})
                     continue
 
+            # ---------------------------------------------------------------
+            # No completion signal — feed execution results back
+            # ---------------------------------------------------------------
             if not execution_results:
                 consecutive_empty_iterations += 1
                 if consecutive_empty_iterations >= 2:
-                    conversation_history += (
-                        f"\n\n[Assistant]:\n{assistant_message}\n\n"
-                        "[System Warning]: No code executed for 2 iterations. You MUST write and run code!"
-                    )
+                    messages.append({
+                        "role": "user",
+                        "content": "No code was executed for 2 iterations. You MUST write and run code, or give a DIRECT_ANSWER."
+                    })
                 continue
             else:
                 consecutive_empty_iterations = 0
 
-            feedback_lines = ["[EXECUTION RESULTS]:"] + execution_results
+            # Build feedback for next user turn
+            feedback_lines = ["[EXECUTION RESULTS]"] + execution_results
 
             if command_errors:
                 feedback_lines.append(
-                    f"\n[ERRORS]: {len(command_errors)} command(s) failed. Try a different approach."
+                    f"\n{len(command_errors)} command(s) failed. Try a different approach."
                 )
-                if python_scripts_run and not curl_commands_run:
-                    feedback_lines.append("[HINT]: Test with curl first before writing Python code!")
             else:
                 is_valid, validation_msg, _ = validate_output_files(workspace)
-                if not is_valid:
+                if is_valid:
                     feedback_lines.append(
-                        f"\n[DATA WARNING]: {validation_msg}\nTry a different approach."
+                        "\nOutput looks good. Verify with `cat`, then say TASK COMPLETE."
                     )
                 else:
                     feedback_lines.append(
-                        "\n[STATUS]: Success. Verify output with `cat`, then say TASK COMPLETE."
+                        f"\nData warning: {validation_msg}. Try a different approach."
                     )
 
-            conversation_history += (
-                f"\n\n[Assistant]:\n{assistant_message}\n\n{chr(10).join(feedback_lines)}"
-            )
+            messages.append({"role": "user", "content": "\n".join(feedback_lines)})
 
+        # End of loop
         if task.status == TaskStatus.RUNNING:
             task.status = TaskStatus.FAILED
             task.error = f"Max iterations ({task.max_iterations}) reached without completion"
