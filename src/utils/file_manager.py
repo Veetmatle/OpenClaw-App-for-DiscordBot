@@ -11,6 +11,7 @@ WORKSPACE_DIR = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
 WORKSPACE_MAX_AGE_HOURS = int(os.environ.get("WORKSPACE_MAX_AGE_HOURS", "24"))
 
 FAILURE_INDICATORS = [
+    # Generic errors
     "no offers found", "no results found", "no data found", "api error",
     "error occurred", "failed to fetch", "could not find", "unable to retrieve",
     "access denied", "403 forbidden", "404 not found", "connection refused",
@@ -19,6 +20,43 @@ FAILURE_INDICATORS = [
     "no jobs found", "no positions found", "request failed", "fetch error",
     "scraping failed", "rate limited", "too many requests", "blocked",
     "captcha", "not available", "service unavailable", "empty array", "empty list",
+    # .NET / dotnet errors
+    "couldn't find a project",
+    "could not find a project",
+    "ensure a project exists",
+    "no project was found",
+    "build failed",
+    "error msbuild",
+    "msbuild failed",
+    "dotnet: command not found",
+    "dotnet sdk not found",
+    "unhandled exception",
+    "system.exception",
+    "system.io.filenotfoundexception",
+    "system.nullreferenceexception",
+    # Python errors
+    "traceback (most recent call last)",
+    "modulenotfounderror",
+    "importerror",
+    "syntaxerror",
+    "nameerror",
+    "typeerror",
+    "valueerror",
+    "filenotfounderror",
+    "permissionerror",
+    # Node / JS errors
+    "cannot find module",
+    "referenceerror",
+    "typeerror:",
+    "syntaxerror:",
+    "err_module_not_found",
+    # Shell / bash errors
+    "command not found",
+    "no such file or directory",
+    "permission denied",
+    "exit code 1",
+    "exit status 1",
+    "segmentation fault",
 ]
 
 PLACEHOLDER_PATTERNS = [
@@ -67,9 +105,11 @@ def check_file_content_validity(file_path: Path) -> tuple[bool, str]:
             if pattern in content:
                 return False, f"File contains placeholder data: '{pattern}'"
 
+        # Złagodzona walidacja — krótkie ale niepuste pliki są OK
+        # (np. wynik obliczenia "42", "True", narysowana gwiazdka itp.)
         lines = [l.strip() for l in content.split('\n') if l.strip()]
-        if len(lines) < 2 and len(content) < 100:
-            return False, "File contains too little data (less than 2 lines, under 100 chars)"
+        if len(lines) < 1 and len(content) < 10:
+            return False, "File is effectively empty (under 10 chars)"
 
         return True, "Content appears valid"
     except Exception as e:
