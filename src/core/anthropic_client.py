@@ -14,7 +14,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_RETRY_MAX_ATTEMPTS = 5
 CLAUDE_RETRY_BASE_DELAY_S = 2.0
 CLAUDE_RETRY_MAX_DELAY_S = 60.0
-MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "30"))
+MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "20"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4096"))
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -74,6 +74,25 @@ TOOLS_BASE = [
             "required": [],
         },
     },
+    {
+        "name": "mark_output",
+        "description": (
+            "Mark one or more files as the final output of this task. "
+            "Call this when your work is done and the result files are ready. "
+            "Only mark files that contain actual results — not intermediate scripts or temp files."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of relative file paths to mark as output, e.g. ['output.txt', 'report.csv']",
+                },
+            },
+            "required": ["files"],
+        },
+    },
 ]
 
 TOOL_WEB_SEARCH = {
@@ -90,10 +109,18 @@ def _get_tools(web_search: bool = False) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Tool execution (only for local tools — web_search is handled by Anthropic)
+# Tool execution
 # ---------------------------------------------------------------------------
 
-def _execute_tool(name: str, inputs: dict[str, Any], workspace: Path) -> str:
+def _execute_tool(
+    name: str,
+    inputs: dict[str, Any],
+    workspace: Path,
+    marked_outputs: list[str],
+) -> str:
+    """Execute a tool call and return result as string.
+    marked_outputs is mutated in place when mark_output is called.
+    """
     from utils.shell_executor import run_command
 
     try:
@@ -144,6 +171,25 @@ def _execute_tool(name: str, inputs: dict[str, Any], workspace: Path) -> str:
             print(f"[tool] list_dir: {path} ({len(entries)} entries)", flush=True)
             return "\n".join(entries) if entries else "(empty)"
 
+        elif name == "mark_output":
+            files = inputs.get("files", [])
+            confirmed = []
+            missing = []
+            for f in files:
+                file_path = workspace / f
+                if file_path.exists():
+                    abs_path = str(file_path.resolve())
+                    if abs_path not in marked_outputs:
+                        marked_outputs.append(abs_path)
+                    confirmed.append(f)
+                else:
+                    missing.append(f)
+            print(f"[tool] mark_output: {confirmed}", flush=True)
+            result = f"OK: marked as output: {confirmed}"
+            if missing:
+                result += f"\nWARNING: files not found (not marked): {missing}"
+            return result
+
         else:
             return f"ERROR: unknown local tool '{name}'"
 
@@ -162,15 +208,17 @@ def call_claude_with_retry(
     task: "AgentTask",
     workspace: Path | None = None,
     web_search: bool = False,
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[str]]:
     """
     Wywołuje Claude z natywnym tool_use.
 
-    Lokalne narzędzia (write_file, run_bash, read_file, list_dir) są wykonywane
-    przez _execute_tool(). web_search jest obsługiwany przez Anthropic API
-    — wyniki wracają automatycznie w kolejnym tool_result.
+    Model używa narzędzi (write_file, run_bash, read_file, list_dir, mark_output,
+    opcjonalnie web_search) dopóki nie skończy i nie wróci end_turn.
 
-    Zwraca (final_text, updated_messages).
+    Zwraca (final_text, marked_output_paths).
+    marked_output_paths to lista bezwzględnych ścieżek plików oznaczonych przez mark_output.
+    Jeśli model nie wywołał mark_output, lista jest pusta — engine wtedy fallbackuje
+    na validate_output_files.
     """
     from datetime import datetime
 
@@ -190,6 +238,7 @@ def call_claude_with_retry(
         try:
             working_messages = list(messages)
             tool_rounds = 0
+            marked_outputs: list[str] = []
 
             while tool_rounds < MAX_TOOL_ROUNDS:
                 response = client.messages.create(
@@ -209,7 +258,7 @@ def call_claude_with_retry(
                         "role": "assistant",
                         "content": response.content,
                     })
-                    return text, working_messages
+                    return text, marked_outputs
 
                 if response.stop_reason == "tool_use":
                     tool_rounds += 1
@@ -225,10 +274,7 @@ def call_claude_with_retry(
                         if task.cancelled:
                             raise RuntimeError("Task cancelled during tool execution.")
 
-                        # web_search results come back from Anthropic directly —
-                        # they appear as server_tool_use blocks, not tool_use,
-                        # so we only need to handle our local tools here.
-                        result = _execute_tool(block.name, block.input, ws)
+                        result = _execute_tool(block.name, block.input, ws, marked_outputs)
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
@@ -242,14 +288,14 @@ def call_claude_with_retry(
                         })
                     continue
 
-                # Any other stop reason — return whatever text we have
+                # Any other stop reason
                 text = "\n".join(
                     block.text for block in response.content
                     if block.type == "text"
                 ).strip()
-                return text, working_messages
+                return text, marked_outputs
 
-            return "Agent hit max tool rounds without completing.", working_messages
+            return "Agent hit max tool rounds without completing.", marked_outputs
 
         except anthropic.RateLimitError as e:
             attempt += 1

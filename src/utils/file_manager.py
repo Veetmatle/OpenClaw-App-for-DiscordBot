@@ -105,8 +105,7 @@ def check_file_content_validity(file_path: Path) -> tuple[bool, str]:
             if pattern in content:
                 return False, f"File contains placeholder data: '{pattern}'"
 
-        # Złagodzona walidacja — krótkie ale niepuste pliki są OK
-        # (np. wynik obliczenia "42", "True", narysowana gwiazdka itp.)
+        # Krótkie ale niepuste pliki są OK (wynik obliczenia, gwiazdka itp.)
         lines = [l.strip() for l in content.split('\n') if l.strip()]
         if len(lines) < 1 and len(content) < 10:
             return False, "File is effectively empty (under 10 chars)"
@@ -170,17 +169,13 @@ def validate_output_files(workspace: Path) -> tuple[bool, str, list[Path]]:
 
 def select_output_files(workspace: Path) -> list[str]:
     """
-    Wybiera pliki do zwrócenia użytkownikowi według priorytetu:
+    Fallback — używany tylko gdy model nie wywołał mark_output.
+    Wybiera pliki według priorytetu:
+    1. Pliki danych (.txt, .csv, .json itp.) — ignoruje skrypty
+    2. Tylko pliki kodu — gdy brak danych
+    3. Fallback — zip wszystkiego
 
-    1. Są pliki danych (.txt, .csv, .json itp.)
-       -> zwróć TYLKO dane, ignoruj skrypty .py
-       -> jeśli > 3 pliki danych: spakuj tylko dane do zip
-       -> jeśli 1-3 pliki danych: zwróć bezpośrednio
-
-    2. Są TYLKO pliki kodu (.py, .cs itp.), brak danych
-       -> zwróć kod (lub zip jeśli > 3)
-
-    3. Fallback: spakuj wszystko
+    Zwraca bezwzględne ścieżki dyskowe (używane przez app.py do odczytu do base64).
     """
     data_extensions = {'.txt', '.json', '.csv', '.xml', '.html', '.md', '.yaml', '.yml', '.xlsx', '.xls'}
     code_extensions = {'.py', '.cs', '.js', '.ts', '.java', '.cpp', '.c', '.h'}
@@ -196,35 +191,27 @@ def select_output_files(workspace: Path) -> list[str]:
             elif ext in code_extensions:
                 code_files.append(f)
 
-    def to_output_path(p: Path) -> str:
-        return str(p).replace(str(WORKSPACE_DIR), '/app/agent-output')
-
     if data_files:
         if len(data_files) > 3:
             zip_path = workspace / "project.zip"
             zip_directory(workspace, zip_path, include_extensions=data_extensions)
-            return [to_output_path(zip_path)]
-        return [to_output_path(f) for f in data_files]
+            return [str(zip_path)]
+        return [str(f) for f in data_files]
 
     if code_files:
         if len(code_files) > 3:
             zip_path = workspace / "project.zip"
             zip_directory(workspace, zip_path, include_extensions=code_extensions)
-            return [to_output_path(zip_path)]
-        return [to_output_path(f) for f in code_files]
+            return [str(zip_path)]
+        return [str(f) for f in code_files]
 
     zip_path = workspace / "project.zip"
     zip_directory(workspace, zip_path)
-    return [to_output_path(zip_path)]
+    return [str(zip_path)]
 
 
 def cleanup_old_workspaces(is_task_active_fn=None) -> None:
-    """Remove workspaces older than WORKSPACE_MAX_AGE_HOURS.
-
-    Args:
-        is_task_active_fn: Optional callable(task_id: str) -> bool that returns
-            True when the task is still running/queued and must not be removed.
-    """
+    """Remove workspaces older than WORKSPACE_MAX_AGE_HOURS."""
     if not WORKSPACE_DIR.exists():
         return
 

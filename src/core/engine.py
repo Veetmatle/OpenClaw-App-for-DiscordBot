@@ -89,9 +89,13 @@ def _needs_web_search(prompt: str) -> bool:
 
 def execute_agent_task(task: AgentTask) -> None:
     """
-    Agent oparty o natywny tool_use — model sam używa narzędzi
-    (write_file, run_bash, read_file, list_dir, opcjonalnie web_search)
-    bez parsowania markdown i bez iteracji ReAct.
+    Agent oparty o natywny tool_use.
+    Model sam używa narzędzi (write_file, run_bash, read_file, list_dir,
+    mark_output, opcjonalnie web_search).
+
+    Priorytet wyboru plików wyjściowych:
+    1. Pliki oznaczone przez model przez mark_output — precyzyjne, bez zgadywania
+    2. Fallback: validate_output_files + select_output_files — gdy model nie wywołał mark_output
     """
     if not _task_semaphore.acquire(blocking=False):
         task.status = TaskStatus.FAILED
@@ -121,7 +125,7 @@ def execute_agent_task(task: AgentTask) -> None:
             flush=True,
         )
 
-        final_text, _ = call_claude_with_retry(
+        final_text, marked_outputs = call_claude_with_retry(
             system_prompt=SYSTEM_PROMPT,
             messages=messages,
             model=task.model,
@@ -134,23 +138,35 @@ def execute_agent_task(task: AgentTask) -> None:
             task.status = TaskStatus.CANCELLED
             return
 
-        is_valid, validation_msg, _ = validate_output_files(workspace)
-
-        if is_valid:
-            task.output_files = select_output_files(workspace)
+        if marked_outputs:
+            # Model explicitly marked output files — use them directly
+            task.output_files = marked_outputs
             task.direct_response = final_text if final_text else None
             task.status = TaskStatus.COMPLETED
-            task.message = f"Completed. {validation_msg}"
-            print(f"[Agent] Task {task.task_id}: COMPLETED ({len(task.output_files)} files)", flush=True)
-        elif final_text:
-            task.direct_response = final_text
-            task.status = TaskStatus.COMPLETED
-            task.message = "Completed with direct answer."
-            print(f"[Agent] Task {task.task_id}: DIRECT_ANSWER", flush=True)
+            task.message = f"Completed. {len(marked_outputs)} output file(s) marked by agent."
+            print(f"[Agent] Task {task.task_id}: COMPLETED via mark_output ({len(marked_outputs)} files)", flush=True)
+
         else:
-            task.status = TaskStatus.FAILED
-            task.error = "Agent produced no output."
-            print(f"[Agent] Task {task.task_id}: FAILED (no output)", flush=True)
+            # Fallback: scan workspace for valid output files
+            is_valid, validation_msg, _ = validate_output_files(workspace)
+
+            if is_valid:
+                task.output_files = select_output_files(workspace)
+                task.direct_response = final_text if final_text else None
+                task.status = TaskStatus.COMPLETED
+                task.message = f"Completed. {validation_msg}"
+                print(f"[Agent] Task {task.task_id}: COMPLETED via fallback scan ({len(task.output_files)} files)", flush=True)
+
+            elif final_text:
+                task.direct_response = final_text
+                task.status = TaskStatus.COMPLETED
+                task.message = "Completed with direct answer."
+                print(f"[Agent] Task {task.task_id}: DIRECT_ANSWER", flush=True)
+
+            else:
+                task.status = TaskStatus.FAILED
+                task.error = "Agent produced no output."
+                print(f"[Agent] Task {task.task_id}: FAILED (no output)", flush=True)
 
     except RuntimeError as e:
         task.status = TaskStatus.FAILED
