@@ -2,9 +2,11 @@
 AI Agent Server - Flask HTTP API for task execution with Claude (Anthropic).
 """
 
+import base64
 import os
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from flask import Flask, request, jsonify
 
@@ -31,6 +33,9 @@ app = Flask(__name__)
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 cleanup_old_workspaces(is_task_active_fn=is_task_active)
 start_cleanup_scheduler(is_task_active_fn=is_task_active)
+
+# Max file size returned inline as base64 (10 MB)
+MAX_INLINE_FILE_BYTES = int(os.environ.get("MAX_INLINE_FILE_BYTES", str(10 * 1024 * 1024)))
 
 
 @app.route('/health', methods=['GET'])
@@ -88,9 +93,65 @@ def get_task_status(task_id: str):
         "TaskId": task.task_id,
         "Status": task.status.value,
         "Message": task.message,
-        "OutputFiles": task.output_files,
-        "DirectResponse": task.direct_response,   
+        "DirectResponse": task.direct_response,
         "Error": task.error,
+        # OutputFiles są teraz tylko metadane (nazwy + rozmiary)
+        # Zawartość pobierana osobno przez GET /tasks/<id>/files
+        "OutputFiles": [
+            {
+                "FileName": Path(p).name,
+                "SizeBytes": Path(p).stat().st_size if Path(p).exists() else 0,
+            }
+            for p in (task.output_files or [])
+        ],
+    })
+
+
+@app.route('/tasks/<task_id>/files', methods=['GET'])
+def get_task_files(task_id: str):
+    """
+    Zwraca zawartość plików wyjściowych jako base64 w JSON.
+    Bot pobiera to przez HTTP — zero shared volume, zero race conditions.
+    """
+    task = get_task(task_id)
+    if not task:
+        return jsonify({"error": "Task not found"}), 404
+
+    if task.status != TaskStatus.COMPLETED:
+        return jsonify({"error": f"Task not completed (status: {task.status.value})"}), 400
+
+    if not task.output_files:
+        return jsonify({"TaskId": task_id, "Files": []}), 200
+
+    files = []
+    for file_path_str in task.output_files:
+        file_path = Path(file_path_str)
+        if not file_path.exists():
+            print(f"[Agent] Warning: output file missing: {file_path}", flush=True)
+            continue
+
+        size = file_path.stat().st_size
+        if size > MAX_INLINE_FILE_BYTES:
+            # Plik za duży — zwróć metadane bez zawartości
+            files.append({
+                "FileName": file_path.name,
+                "SizeBytes": size,
+                "ContentBase64": None,
+                "TooLarge": True,
+            })
+            continue
+
+        content_b64 = base64.b64encode(file_path.read_bytes()).decode("utf-8")
+        files.append({
+            "FileName": file_path.name,
+            "SizeBytes": size,
+            "ContentBase64": content_b64,
+            "TooLarge": False,
+        })
+
+    return jsonify({
+        "TaskId": task_id,
+        "Files": files,
     })
 
 
